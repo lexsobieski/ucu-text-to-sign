@@ -1,0 +1,25 @@
+# Credentials
+serviceAccountKey.json
+
+# Data (large, reproducible)
+data/usl-suspilne/
+data/cache/
+data/firebase/
+data/labeling/
+data/external/
+*.tar.gz
+
+# Downloaded model assets
+models/
+
+# Experiment artifacts
+experiments/*/model/Models/
+experiments/*/model/Data/
+
+# Archives
+*.zip
+
+# OS / IDE
+.DS_Store
+__pycache__/
+.idea/
