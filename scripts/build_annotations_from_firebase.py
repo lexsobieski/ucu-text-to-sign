@@ -117,8 +117,11 @@ def normalize_text(text: str) -> str:
     return " ".join(cleaned)
 
 
-DEV_VIDEOS = {"uGMgleLkjho", "w_LdfLKP_0o"}
-TEST_VIDEOS = {"K9ouFMtz-s8", "SG9xYYOLBNI"}
+DEV_VIDEOS = {"6O0ZiSgKJNc", "cNT6ajjEwVU"}
+TEST_VIDEOS = {"0ULOz5HM4pA", "SG9xYYOLBNI"}
+# Held-out signer (s3) — never appears in train/dev/test, used for
+# signer-independent evaluation.
+TEST_UNSEEN_VIDEOS = {"82dy0zC6X_8"}
 
 
 def get_split(video_id):
@@ -126,6 +129,8 @@ def get_split(video_id):
         return "dev"
     if video_id in TEST_VIDEOS:
         return "test"
+    if video_id in TEST_UNSEEN_VIDEOS:
+        return "test_unseen"
     return "train"
 
 
@@ -135,22 +140,49 @@ def extract_video_id(url):
     return m.group(1) if m else None
 
 
-def build_annotations(export_path, output_csv, splits_csv,
-                      include_all=False, min_duration=0.3):
+def _load_signer_mapping(signers_path):
+    """Load {video_id: {clip_name: signer_id}} from identify_signers.py output.
+
+    Returns an empty dict (and warns) if the file is missing so the caller
+    can still build annotations with signer_id left blank.
+    """
+    signers_path = Path(signers_path)
+    if not signers_path.exists():
+        print(f"  [WARN] signers file missing ({signers_path}); signer_id will be blank")
+        return {}
+    with open(signers_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    out = {}
+    for vid, info in raw.items():
+        out[vid] = info.get("clips", {})
+    return out
+
+
+def build_annotations(export_path, output_csv, splits_csv, dataset_dir,
+                      signers_path=None, include_all=False,
+                      min_duration=0.3, max_duration=60.0):
     """Build annotations from Firebase export.
 
     Args:
         export_path: Path to Firebase RTDB export JSON.
-        output_csv: Output path for annotations.csv.
-        splits_csv: Output path for splits.csv.
+        output_csv: Output path for the combined annotations CSV (intermediate).
+        splits_csv: Output path for splits.csv (download/split manifest).
+        dataset_dir: Directory where train.csv/dev.csv/test.csv land (the
+            final training split files that consumers actually read).
+        signers_path: Optional path to signers.json from identify_signers.py.
+            If provided, adds a signer_id column to the outputs.
         include_all: Include non-aligned captions.
         min_duration: Minimum clip duration in seconds.
+        max_duration: Maximum clip duration in seconds (filters unsegmented captions).
 
     Returns dict with stats: {"rows": int, "videos": set}.
     """
     export_path = Path(export_path)
     output_csv = Path(output_csv)
     splits_csv = Path(splits_csv)
+    dataset_dir = Path(dataset_dir)
+
+    signer_mapping = _load_signer_mapping(signers_path) if signers_path else {}
 
     with open(export_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -193,45 +225,50 @@ def build_annotations(export_path, output_csv, splits_csv,
 
             start = c.get("start_time", 0)
             end = c.get("end_time", 0)
-            if end - start < min_duration:
+            dur = end - start
+            if dur < min_duration or dur > max_duration:
                 clip_idx += 1
                 continue
 
             name = f"{yt_id}/{clip_idx:04d}"
             raw_text = c.get("text", "").strip()
+            signer_id = signer_mapping.get(yt_id, {}).get(f"{clip_idx:04d}.mp4")
             rows.append({
                 "name": name,
                 "video": f"{name}.mp4",
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "annotator": yt_id_to_annotator.get(yt_id, "unknown"),
+                "signer_id": signer_id if signer_id is not None else "",
                 "text": raw_text,
                 "text_norm": normalize_text(raw_text),
             })
             clip_idx += 1
 
-    # Write annotations CSV
-    fieldnames = ["name", "text", "text_norm", "annotator"]
+    # Write annotations CSV (full schema, keeps annotator for QA)
+    annotations_fields = ["name", "text", "text_norm", "annotator", "signer_id"]
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="|")
+        writer = csv.DictWriter(f, fieldnames=annotations_fields, delimiter="|")
         writer.writeheader()
         for r in rows:
-            writer.writerow({k: r[k] for k in fieldnames})
+            writer.writerow({k: r[k] for k in annotations_fields})
 
-    # Write per-split CSVs
-    split_rows = {"train": [], "dev": [], "test": []}
+    # Write per-split CSVs (training schema — no annotator, no raw text)
+    split_fields = ["name", "text_norm", "signer_id"]
+    split_rows = {"train": [], "dev": [], "test": [], "test_unseen": []}
     for r in rows:
         vid = r["name"].split("/")[0]
         split_rows[get_split(vid)].append(r)
 
+    dataset_dir.mkdir(parents=True, exist_ok=True)
     for split_name, items in split_rows.items():
-        split_path = output_csv.parent / f"{split_name}.csv"
+        split_path = dataset_dir / f"{split_name}.csv"
         with open(split_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, delimiter="|")
+            writer = csv.DictWriter(f, fieldnames=split_fields, delimiter="|")
             writer.writeheader()
             for r in items:
-                writer.writerow({k: r[k] for k in fieldnames})
+                writer.writerow({k: r[k] for k in split_fields})
         print(f"  {split_name}: {len(items)} clips -> {split_path}")
 
     # Write splits CSV
@@ -256,8 +293,10 @@ def build_annotations(export_path, output_csv, splits_csv,
 
 def main():
     default_export = ROOT / "data/firebase/latest.json"
-    default_output = ROOT / "data/usl-suspilne/annotations.csv"
+    default_output = ROOT / "data/cache/annotations.csv"
     default_splits = ROOT / "data/cache/splits.csv"
+    default_signers = ROOT / "data/cache/signers.json"
+    default_dataset = ROOT / "data/usl-suspilne"
 
     parser = argparse.ArgumentParser(description="Build annotations from Firebase export")
     parser.add_argument("--export", type=Path, default=default_export,
@@ -266,18 +305,28 @@ def main():
                         help=f"Output annotations CSV (default: {default_output})")
     parser.add_argument("--splits", type=Path, default=default_splits,
                         help=f"Output splits CSV (default: {default_splits})")
+    parser.add_argument("--dataset-dir", type=Path, default=default_dataset,
+                        help=f"Where to write train/dev/test.csv (default: {default_dataset})")
+    parser.add_argument("--signers", type=Path, default=default_signers,
+                        help=f"Per-clip signer mapping from identify_signers.py "
+                             f"(default: {default_signers}, missing file → blank signer_id)")
     parser.add_argument("--all", action="store_true",
                         help="Include incomplete videos and non-aligned captions")
     parser.add_argument("--min-duration", type=float, default=0.3,
                         help="Minimum clip duration in seconds (default: 0.3)")
+    parser.add_argument("--max-duration", type=float, default=60.0,
+                        help="Maximum clip duration in seconds (default: 60.0)")
     args = parser.parse_args()
 
     build_annotations(
         export_path=args.export,
         output_csv=args.output,
         splits_csv=args.splits,
+        dataset_dir=args.dataset_dir,
+        signers_path=args.signers,
         include_all=args.all,
         min_duration=args.min_duration,
+        max_duration=args.max_duration,
     )
 
 
