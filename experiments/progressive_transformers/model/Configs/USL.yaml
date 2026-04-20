@@ -1,0 +1,67 @@
+data:
+    src: "text"     # Source - Text->Pose
+    trg: "skels"    # Target - 3D body co-ordinates
+    files: "files"  # Filenames for each sequence
+
+    train: "./Data/usl/train"
+    dev: "./Data/usl/dev"
+    test: "./Data/usl/test"
+
+    max_sent_length: 300 # Max Sentence Length (300 frames @ skip_frames=2 = 20s raw)
+    skip_frames: 2   # Skip frames in the data
+    src_vocab: "./Configs/usl_src_vocab.txt"
+
+training:
+    random_seed: 42
+    optimizer: "adam"
+    learning_rate: 0.0005
+    learning_rate_min: 0.0001
+    weight_decay: 1.0e-5
+    clip_grad_norm: 5.0
+    batch_size: 32
+    scheduling: "plateau"
+    patience: 30
+    decrease_factor: 0.7
+    early_stopping_metric: "loss"
+    epochs: 5000
+    validation_freq: 50
+    logging_freq: 50
+    eval_metric: "dtw"
+    model_dir: "./Models/USL"
+    overwrite: True
+    continue: False
+    shuffle: True
+    use_cuda: True
+    max_output_length: 300
+    keep_last_ckpts: 1
+    loss: "MSE"
+
+model:
+    initializer: "xavier"
+    bias_initializer: "zeros"
+    embed_initializer: "xavier"
+    trg_size: 150  # 50 joints x 3D (x, y, z)
+    just_count_in: False
+    gaussian_noise: True
+    noise_rate: 1
+    future_prediction: 0
+    encoder:
+        type: "transformer"
+        num_layers: 2
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256   # Smaller for small dataset
+            dropout: 0.1         # Regularisation
+        hidden_size: 256
+        ff_size: 1024            # 4 x hidden_size
+        dropout: 0.1
+    decoder:
+        type: "transformer"
+        num_layers: 2
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256
+            dropout: 0.1
+        hidden_size: 256
+        ff_size: 1024
+        dropout: 0.1
