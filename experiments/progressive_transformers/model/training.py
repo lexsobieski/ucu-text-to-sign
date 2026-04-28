@@ -22,6 +22,7 @@ from helpers import  load_config, log_cfg, load_checkpoint, make_model_dir, \
 from model import Model
 from prediction import validate_on_data
 from loss import RegLoss, XentLoss
+from mdn import MDNLoss
 from data import load_data, make_data_iter
 from builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
@@ -71,9 +72,15 @@ class TrainManager:
         self._log_parameters_list()
         self.target_pad = TARGET_PAD
 
-        # New Regression loss - depending on config
-        self.loss = RegLoss(cfg = config,
-                            target_pad=self.target_pad)
+        # Regression or MDN loss, depending on config
+        mdn_k = config["model"].get("mdn_n_components", 0)
+        if mdn_k > 0:
+            # The MDN operates over the same D dims the regression loss would use
+            self.loss = MDNLoss(n_components=mdn_k,
+                                trg_size=self.model.mdn_pose_dim,
+                                target_pad=self.target_pad)
+        else:
+            self.loss = RegLoss(cfg=config, target_pad=self.target_pad)
 
         self.normalization = "batch"
 

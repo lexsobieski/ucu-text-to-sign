@@ -2,19 +2,19 @@
 """
 Prepare data files for Progressive Transformers training.
 
-Pipeline:
-  1. Select 50 joints from 75-joint MediaPipe Holistic poses
-  2. Lift 2D → 3D via gopeith/3DposeEstimator
-  3. Normalize, generate .text/.skels/.files + vocabulary
+Normalizes pre-lifted 3D poses and emits per-split .text/.skels/.files plus a
+source vocabulary. The 75-joint Holistic → 50-joint → 3D lifting step happens
+upstream in build_dataset.ipynb (scripts/lift_to_3d.py); this script assumes
+poses/mediapipe_3d/ already exists.
 
 Reads:
   - data/usl-suspilne/{train,dev,test,test_unseen}.csv
-  - data/usl-suspilne/poses/mediapipe_holistic/{videoId}/{clipIdx}.npy  (T, 225)
+  - data/usl-suspilne/poses/mediapipe_3d/{videoId}/{clipIdx}.npy  (T, 150)
 
 Writes:
-  - data/usl-suspilne/poses/mediapipe_3d/{videoId}/{clipIdx}.npy
   - experiments/progressive_transformers/model/Data/usl/{split}.text/.skels/.files
   - experiments/progressive_transformers/model/Configs/usl_src_vocab.txt
+  - experiments/progressive_transformers/model/Configs/usl_pose_norm.npz
 
 Usage:
     python experiments/progressive_transformers/prepare_data.py
@@ -23,7 +23,6 @@ Usage:
 
 import argparse
 import csv
-import sys
 import tempfile
 from collections import Counter
 from pathlib import Path
@@ -33,8 +32,6 @@ import numpy as np
 EXPERIMENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = EXPERIMENT_DIR.parent.parent
 SP_MODEL_PATH = EXPERIMENT_DIR / "model/Configs/usl_sp.model"
-
-sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 SPLITS = ["train", "dev", "test", "test_unseen"]
 
@@ -68,100 +65,6 @@ def build_bpe_tokenizer(train_texts, vocab_size):
     sp = spm.SentencePieceProcessor(model_file=str(SP_MODEL_PATH))
     print(f"Trained BPE model: vocab_size={sp.get_piece_size()}, saved to {SP_MODEL_PATH}")
     return sp
-
-
-# 75-joint Holistic → 50-joint layout for Progressive Transformers:
-#   Body: Nose(0), Neck(midpoint 11,12), RShoulder(12), RElbow(14), RWrist(16),
-#         LShoulder(11), LElbow(13), LWrist(15)
-#   Left hand: joints 33-53 (21 landmarks)
-#   Right hand: joints 54-74 (21 landmarks)
-# Output: 50 joints × (x, y, confidence) = 150 values
-_BODY8_HOLISTIC_INDICES = [0, None, 12, 14, 16, 11, 13, 15]
-
-
-def holistic_to_50joint(poses_225):
-    """Convert (T, 225) Holistic poses to (T, 150) 50-joint format.
-
-    Selects 8 upper-body joints + both hands from the 75-joint layout.
-    """
-    T = poses_225.shape[0]
-    joints_75x3 = poses_225.reshape(T, 75, 3)
-
-    out = np.zeros((T, 50, 3), dtype=np.float32)
-
-    # Body (8 joints)
-    for i, mp_idx in enumerate(_BODY8_HOLISTIC_INDICES):
-        if mp_idx is None:  # Neck = midpoint(LShoulder=11, RShoulder=12)
-            out[:, i] = (joints_75x3[:, 11] + joints_75x3[:, 12]) / 2
-        else:
-            out[:, i] = joints_75x3[:, mp_idx]
-
-    # Left hand (joints 33-53 → slots 8-28)
-    out[:, 8:29] = joints_75x3[:, 33:54]
-
-    # Right hand (joints 54-74 → slots 29-49)
-    out[:, 29:50] = joints_75x3[:, 54:75]
-
-    return out.reshape(T, 150)
-
-
-def select_and_lift(holistic_dir, poses_3d_dir):
-    """Select 50 joints from Holistic output and lift to 3D.
-
-    Args:
-        holistic_dir: Directory with 75-joint Holistic npy files.
-        poses_3d_dir: Output directory for 3D-lifted 50-joint npy files.
-
-    Returns:
-        dict with 'total', 'failed', 'cached' counts.
-    """
-    from lift_to_3d import lift_clip, get_skeletal_model_structure
-
-    holistic_dir, poses_3d_dir = Path(holistic_dir), Path(poses_3d_dir)
-    clips = sorted(holistic_dir.glob("*/*.npy"))
-    print(f"Found {len(clips)} Holistic pose files in {holistic_dir}\n")
-
-    if not clips:
-        print("No Holistic poses found. Run extract_poses.py first.")
-        sys.exit(1)
-
-    poses_3d_dir.mkdir(parents=True, exist_ok=True)
-    structure = get_skeletal_model_structure()
-
-    failed = 0
-    cached = 0
-    for i, clip_path in enumerate(clips):
-        video_id = clip_path.parent.name
-        clip_name = clip_path.stem
-        out_path = poses_3d_dir / video_id / f"{clip_name}.npy"
-
-        if out_path.exists():
-            cached += 1
-            if (i + 1) % 500 == 0:
-                print(f"  [{i+1}/{len(clips)}] {cached} cached so far")
-            continue
-
-        poses_225 = np.load(clip_path)
-        if poses_225.shape[0] < 2 or poses_225.shape[1] != 225:
-            print(f"  [{i+1}/{len(clips)}] {video_id}/{clip_name}: "
-                  f"unexpected shape {poses_225.shape}, skipping")
-            failed += 1
-            continue
-
-        # 75-joint → 50-joint
-        poses_2d = holistic_to_50joint(poses_225)
-
-        # 2D → 3D
-        print(f"  [{i+1}/{len(clips)}] {video_id}/{clip_name}: "
-              f"{poses_2d.shape[0]} frames, lifting to 3D ...")
-        poses_3d = lift_clip(poses_2d, structure)
-
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        np.save(out_path, poses_3d)
-
-    total = len(list(poses_3d_dir.glob("*/*.npy")))
-    print(f"\nDone. {total} 3D poses ({cached} cached, {failed} failed)")
-    return {"total": total, "failed": failed, "cached": cached}
 
 
 def load_annotations(annotation_path):
@@ -335,7 +238,6 @@ def prepare_all(split_dir, poses_dir, out_dir, vocab_path, norm_stats_path, bpe=
 
 def main():
     default_split_dir = PROJECT_ROOT / "data/usl-suspilne"
-    default_holistic = PROJECT_ROOT / "data/usl-suspilne/poses/mediapipe_holistic"
     default_poses_3d = PROJECT_ROOT / "data/usl-suspilne/poses/mediapipe_3d"
     default_out = EXPERIMENT_DIR / "model/Data/usl"
     default_vocab = EXPERIMENT_DIR / "model/Configs/usl_src_vocab.txt"
@@ -344,26 +246,14 @@ def main():
     parser = argparse.ArgumentParser(description="Prepare Progressive Transformers data")
     parser.add_argument("--split-dir", type=Path, default=default_split_dir,
                         help=f"Directory with train/dev/test.csv (default: {default_split_dir})")
-    parser.add_argument("--holistic", type=Path, default=default_holistic,
-                        help=f"Holistic poses directory (default: {default_holistic})")
     parser.add_argument("--poses-3d", type=Path, default=default_poses_3d,
-                        help=f"3D poses output directory (default: {default_poses_3d})")
+                        help=f"3D poses directory (default: {default_poses_3d})")
     parser.add_argument("--out", type=Path, default=default_out,
                         help=f"Output directory (default: {default_out})")
     parser.add_argument("--bpe", type=int, default=None,
                         help="Use BPE subword tokenization with this vocab size (e.g. 2000)")
-    parser.add_argument("--skip-lift", action="store_true",
-                        help="Skip 3D lifting (use existing poses_3d)")
     args = parser.parse_args()
 
-    # Step 1: Select 50 joints and lift to 3D
-    if not args.skip_lift:
-        print("=== Step 1: Select joints & lift to 3D ===\n")
-        select_and_lift(holistic_dir=args.holistic, poses_3d_dir=args.poses_3d)
-        print()
-
-    # Step 2: Generate training files
-    print("=== Step 2: Generate training data ===\n")
     prepare_all(split_dir=args.split_dir, poses_dir=args.poses_3d,
                 out_dir=args.out, vocab_path=default_vocab,
                 norm_stats_path=default_norm, bpe=args.bpe)

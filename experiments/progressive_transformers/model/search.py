@@ -80,6 +80,11 @@ def greedy(
                 trg_mask=padding_mask,
             )
 
+            # MDN: collapse the raw mixture parameters into a single pose tensor
+            # before any future_prediction slicing or feedback.
+            if getattr(model, "mdn_n_components", 0) > 0:
+                out = model.decode_mdn(out)
+
             if model.future_prediction != 0:
                 # Cut to only the first frame prediction
                 out = torch.cat((out[:, :, :out.shape[2] // (model.future_prediction)],out[:,:,-1:]),dim=2)

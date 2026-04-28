@@ -43,6 +43,11 @@ def summarize_export(data):
     if isinstance(videos, list):
         videos = {str(i): v for i, v in enumerate(videos) if v is not None}
 
+    completed_videos = sum(
+        1 for v in videos.values()
+        if isinstance(v, dict) and v.get("complete")
+    )
+
     video_captions = data.get("video_captions", {})
     total_captions = 0
     aligned_captions = 0
@@ -56,11 +61,16 @@ def summarize_export(data):
                 if c.get("aligned"):
                     aligned_captions += 1
 
-    print(f"  Videos: {len(videos)}")
+    print(f"  Videos: {len(videos)} ({completed_videos} marked complete)")
     print(f"  Video captions entries: {len(video_captions)}")
     print(f"  Total captions: {total_captions}")
     print(f"  Aligned captions: {aligned_captions}")
-    return {"videos": len(videos), "captions": total_captions, "aligned": aligned_captions}
+    return {
+        "videos": len(videos),
+        "completed_videos": completed_videos,
+        "captions": total_captions,
+        "aligned": aligned_captions,
+    }
 
 
 def download_and_save(output_dir, key_path=None, export_date=None):

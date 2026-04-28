@@ -3,8 +3,11 @@
 Build annotation CSV from the Firebase RTDB export.
 
 Reads aligned captions from the export JSON and produces:
-  - data/usl-suspilne/annotations.csv  (name|text|text_norm|annotator — for training)
-  - data/cache/splits.csv              (name|video|start|end — for download_and_split.py)
+  - data/cache/annotations.csv  (name|text|text_norm|annotator)
+  - data/cache/splits.csv       (name|video|start|end|split — clip manifest with split assignment)
+
+The published per-split CSVs (train/dev/test/test_unseen.csv) are written later
+by write_dataset_splits.py, after identify_signers.py has produced signers.json.
 
 Usage:
     python scripts/build_annotations_from_firebase.py
@@ -14,6 +17,7 @@ Usage:
 import argparse
 import csv
 import json
+import random
 import re
 from pathlib import Path
 
@@ -117,21 +121,61 @@ def normalize_text(text: str) -> str:
     return " ".join(cleaned)
 
 
+# =====================================================================
+# Split strategies
+#
+# Each strategy is a callable that takes the full list of row dicts and
+# returns a dict {"train", "dev", "test", "test_unseen"} of row lists.
+# Add a new strategy by writing a function and registering it in
+# SPLIT_STRATEGIES below.
+# =====================================================================
+
+# Hardcoded video-level partition (the historical 25-video split):
 DEV_VIDEOS = {"6O0ZiSgKJNc", "cNT6ajjEwVU"}
 TEST_VIDEOS = {"0ULOz5HM4pA", "SG9xYYOLBNI"}
-# Held-out signer (s3) — never appears in train/dev/test, used for
-# signer-independent evaluation.
+# Held-out signer (s3): used for signer-independent evaluation.
 TEST_UNSEEN_VIDEOS = {"82dy0zC6X_8"}
 
 
-def get_split(video_id):
-    if video_id in DEV_VIDEOS:
-        return "dev"
-    if video_id in TEST_VIDEOS:
-        return "test"
-    if video_id in TEST_UNSEEN_VIDEOS:
-        return "test_unseen"
-    return "train"
+def videolevel_split(rows, **kwargs):
+    """Assign each row to train/dev/test/test_unseen by its video ID,
+    using the hardcoded DEV_VIDEOS / TEST_VIDEOS / TEST_UNSEEN_VIDEOS sets.
+    Anything not matched falls into train."""
+    out = {"train": [], "dev": [], "test": [], "test_unseen": []}
+    for r in rows:
+        vid = r["name"].split("/")[0]
+        if vid in DEV_VIDEOS:
+            out["dev"].append(r)
+        elif vid in TEST_VIDEOS:
+            out["test"].append(r)
+        elif vid in TEST_UNSEEN_VIDEOS:
+            out["test_unseen"].append(r)
+        else:
+            out["train"].append(r)
+    return out
+
+
+def cliplevel_random_split(rows, seed: int = 42,
+                           ratios=(0.8, 0.1, 0.1), **kwargs):
+    """Random clip-level 80/10/10 split. test_unseen is left empty."""
+    assert abs(sum(ratios) - 1.0) < 1e-6, f"ratios must sum to 1, got {ratios}"
+    shuffled = list(rows)
+    random.Random(seed).shuffle(shuffled)
+    n = len(shuffled)
+    n_train = int(n * ratios[0])
+    n_dev = int(n * ratios[1])
+    return {
+        "train": shuffled[:n_train],
+        "dev": shuffled[n_train:n_train + n_dev],
+        "test": shuffled[n_train + n_dev:],
+        "test_unseen": [],
+    }
+
+
+SPLIT_STRATEGIES = {
+    "video": videolevel_split,
+    "random": cliplevel_random_split,
+}
 
 
 def extract_video_id(url):
@@ -140,49 +184,30 @@ def extract_video_id(url):
     return m.group(1) if m else None
 
 
-def _load_signer_mapping(signers_path):
-    """Load {video_id: {clip_name: signer_id}} from identify_signers.py output.
-
-    Returns an empty dict (and warns) if the file is missing so the caller
-    can still build annotations with signer_id left blank.
-    """
-    signers_path = Path(signers_path)
-    if not signers_path.exists():
-        print(f"  [WARN] signers file missing ({signers_path}); signer_id will be blank")
-        return {}
-    with open(signers_path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    out = {}
-    for vid, info in raw.items():
-        out[vid] = info.get("clips", {})
-    return out
-
-
-def build_annotations(export_path, output_csv, splits_csv, dataset_dir,
-                      signers_path=None, include_all=False,
-                      min_duration=0.3, max_duration=60.0):
+def build_annotations(export_path, output_csv, splits_csv,
+                      include_all=False,
+                      min_duration=0.3, max_duration=60.0,
+                      split_strategy="video", split_seed=42):
     """Build annotations from Firebase export.
 
     Args:
         export_path: Path to Firebase RTDB export JSON.
-        output_csv: Output path for the combined annotations CSV (intermediate).
-        splits_csv: Output path for splits.csv (download/split manifest).
-        dataset_dir: Directory where train.csv/dev.csv/test.csv land (the
-            final training split files that consumers actually read).
-        signers_path: Optional path to signers.json from identify_signers.py.
-            If provided, adds a signer_id column to the outputs.
+        output_csv: Output path for annotations.csv (name|text|text_norm|annotator).
+        splits_csv: Output path for splits.csv — clip manifest with the split
+            assignment recorded as an extra column (name|video|start|end|split).
+            Consumed by download_videos.py, split_videos.py, and later by
+            write_dataset_splits.py.
         include_all: Include non-aligned captions.
         min_duration: Minimum clip duration in seconds.
         max_duration: Maximum clip duration in seconds (filters unsegmented captions).
+        split_strategy: Name of a registered split strategy (see SPLIT_STRATEGIES).
+        split_seed: RNG seed for split strategies that need one.
 
     Returns dict with stats: {"rows": int, "videos": set}.
     """
     export_path = Path(export_path)
     output_csv = Path(output_csv)
     splits_csv = Path(splits_csv)
-    dataset_dir = Path(dataset_dir)
-
-    signer_mapping = _load_signer_mapping(signers_path) if signers_path else {}
 
     with open(export_path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -232,21 +257,29 @@ def build_annotations(export_path, output_csv, splits_csv, dataset_dir,
 
             name = f"{yt_id}/{clip_idx:04d}"
             raw_text = c.get("text", "").strip()
-            signer_id = signer_mapping.get(yt_id, {}).get(f"{clip_idx:04d}.mp4")
             rows.append({
                 "name": name,
                 "video": f"{name}.mp4",
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "annotator": yt_id_to_annotator.get(yt_id, "unknown"),
-                "signer_id": signer_id if signer_id is not None else "",
                 "text": raw_text,
                 "text_norm": normalize_text(raw_text),
             })
             clip_idx += 1
 
-    # Write annotations CSV (full schema, keeps annotator for QA)
-    annotations_fields = ["name", "text", "text_norm", "annotator", "signer_id"]
+    # Assign each row to a split using the chosen strategy.
+    # The split is recorded in splits.csv so write_dataset_splits.py can route
+    # rows later (after signer identification) without re-running the strategy.
+    if split_strategy not in SPLIT_STRATEGIES:
+        raise ValueError(f"unknown split_strategy {split_strategy!r}; "
+                         f"available: {sorted(SPLIT_STRATEGIES)}")
+    print(f"  split_strategy={split_strategy}")
+    split_rows = SPLIT_STRATEGIES[split_strategy](rows, seed=split_seed)
+    name_to_split = {r["name"]: split for split, items in split_rows.items() for r in items}
+
+    # Write annotations CSV (clip-level metadata from Firebase, no signer info yet)
+    annotations_fields = ["name", "text", "text_norm", "annotator"]
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(output_csv, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=annotations_fields, delimiter="|")
@@ -254,30 +287,22 @@ def build_annotations(export_path, output_csv, splits_csv, dataset_dir,
         for r in rows:
             writer.writerow({k: r[k] for k in annotations_fields})
 
-    # Write per-split CSVs (training schema — no annotator, no raw text)
-    split_fields = ["name", "text_norm", "signer_id"]
-    split_rows = {"train": [], "dev": [], "test": [], "test_unseen": []}
-    for r in rows:
-        vid = r["name"].split("/")[0]
-        split_rows[get_split(vid)].append(r)
-
-    dataset_dir.mkdir(parents=True, exist_ok=True)
-    for split_name, items in split_rows.items():
-        split_path = dataset_dir / f"{split_name}.csv"
-        with open(split_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=split_fields, delimiter="|")
-            writer.writeheader()
-            for r in items:
-                writer.writerow({k: r[k] for k in split_fields})
-        print(f"  {split_name}: {len(items)} clips -> {split_path}")
-
-    # Write splits CSV
+    # Write splits CSV (clip manifest + split assignment)
+    splits_fields = ["name", "video", "start", "end", "split"]
     splits_csv.parent.mkdir(parents=True, exist_ok=True)
     with open(splits_csv, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["name", "video", "start", "end"], delimiter="|")
+        writer = csv.DictWriter(f, fieldnames=splits_fields, delimiter="|")
         writer.writeheader()
         for r in rows:
-            writer.writerow({"name": r["name"], "video": r["video"], "start": r["start"], "end": r["end"]})
+            writer.writerow({
+                "name": r["name"],
+                "video": r["video"],
+                "start": r["start"],
+                "end": r["end"],
+                "split": name_to_split[r["name"]],
+            })
+    for split_name, items in split_rows.items():
+        print(f"  {split_name}: {len(items)} clips")
 
     # Stats
     videos_seen = set(r["name"].split("/")[0] for r in rows)
@@ -295,8 +320,6 @@ def main():
     default_export = ROOT / "data/firebase/latest.json"
     default_output = ROOT / "data/cache/annotations.csv"
     default_splits = ROOT / "data/cache/splits.csv"
-    default_signers = ROOT / "data/cache/signers.json"
-    default_dataset = ROOT / "data/usl-suspilne"
 
     parser = argparse.ArgumentParser(description="Build annotations from Firebase export")
     parser.add_argument("--export", type=Path, default=default_export,
@@ -305,28 +328,29 @@ def main():
                         help=f"Output annotations CSV (default: {default_output})")
     parser.add_argument("--splits", type=Path, default=default_splits,
                         help=f"Output splits CSV (default: {default_splits})")
-    parser.add_argument("--dataset-dir", type=Path, default=default_dataset,
-                        help=f"Where to write train/dev/test.csv (default: {default_dataset})")
-    parser.add_argument("--signers", type=Path, default=default_signers,
-                        help=f"Per-clip signer mapping from identify_signers.py "
-                             f"(default: {default_signers}, missing file → blank signer_id)")
     parser.add_argument("--all", action="store_true",
                         help="Include incomplete videos and non-aligned captions")
     parser.add_argument("--min-duration", type=float, default=0.3,
                         help="Minimum clip duration in seconds (default: 0.3)")
     parser.add_argument("--max-duration", type=float, default=60.0,
                         help="Maximum clip duration in seconds (default: 60.0)")
+    parser.add_argument("--split-strategy", choices=sorted(SPLIT_STRATEGIES),
+                        default="video",
+                        help=f"How to assign clips to splits "
+                             f"(default: video; choices: {sorted(SPLIT_STRATEGIES)})")
+    parser.add_argument("--split-seed", type=int, default=42,
+                        help="RNG seed for split strategies that need one (e.g. random)")
     args = parser.parse_args()
 
     build_annotations(
         export_path=args.export,
         output_csv=args.output,
         splits_csv=args.splits,
-        dataset_dir=args.dataset_dir,
-        signers_path=args.signers,
         include_all=args.all,
         min_duration=args.min_duration,
         max_duration=args.max_duration,
+        split_strategy=args.split_strategy,
+        split_seed=args.split_seed,
     )
 
 

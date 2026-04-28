@@ -10,10 +10,13 @@ Pipeline (from the paper / repo):
   5. Initial 3D estimation (bone lengths + angles from 2D)
   6. Backpropagation-based filtering (TensorFlow optimisation)
 
-Reads:  data/usl-suspilne/poses/2d/{videoId}/{clipIdx}.npy  — shape (T, 150), triplets of (x, y, confidence)
-Writes: data/usl-suspilne/poses/3d/{videoId}/{clipIdx}.npy   — shape (T, 150), triplets of (x, y, z)
+Reads:  data/usl-suspilne/poses/mediapipe_holistic/{videoId}/{clipIdx}.npy
+        — shape (T, 225) = 75 joints × (x, y, visibility), from extract_poses.py
+Writes: data/usl-suspilne/poses/mediapipe_3d/{videoId}/{clipIdx}.npy
+        — shape (T, 150) = 50 joints × (x, y, z), used by both the PT and
+        pose_diffusion experiments.
 
-The 50-joint skeletal model:
+The 50-joint skeletal model (output):
   0: Nose, 1: Neck, 2: RShoulder, 3: RElbow, 4: RWrist,
   5: LShoulder, 6: LElbow, 7: LWrist,
   8-28: Left hand (21 MediaPipe landmarks),
@@ -502,27 +505,62 @@ def lift_clip(poses_2d: np.ndarray, structure, dtype="float32") -> np.ndarray:
     return poses_3d
 
 
+# ============================================================================
+# 75-joint Holistic -> 50-joint selection
+# ============================================================================
+#
+# Body: Nose(0), Neck(midpoint of MP 11, 12), RShoulder(12), RElbow(14),
+#       RWrist(16), LShoulder(11), LElbow(13), LWrist(15)
+# Left hand:  joints 33-53 (21 MediaPipe hand landmarks)
+# Right hand: joints 54-74 (21 MediaPipe hand landmarks)
+_BODY8_HOLISTIC_INDICES = [0, None, 12, 14, 16, 11, 13, 15]
+
+
+def holistic_to_50joint(poses_225: np.ndarray) -> np.ndarray:
+    """Convert (T, 225) Holistic poses to (T, 150) 50-joint format."""
+    T = poses_225.shape[0]
+    joints_75x3 = poses_225.reshape(T, 75, 3)
+
+    out = np.zeros((T, 50, 3), dtype=np.float32)
+
+    for i, mp_idx in enumerate(_BODY8_HOLISTIC_INDICES):
+        if mp_idx is None:  # Neck = midpoint(LShoulder=11, RShoulder=12)
+            out[:, i] = (joints_75x3[:, 11] + joints_75x3[:, 12]) / 2
+        else:
+            out[:, i] = joints_75x3[:, mp_idx]
+
+    out[:, 8:29] = joints_75x3[:, 33:54]   # left hand  -> slots 8-28
+    out[:, 29:50] = joints_75x3[:, 54:75]  # right hand -> slots 29-49
+
+    return out.reshape(T, 150)
+
+
+# ============================================================================
+# Batch driver: 75-joint Holistic -> 50-joint -> 3D
+# ============================================================================
+
 def lift_all(src, dst):
-    """Lift all 2D poses to 3D.
+    """Select 50 joints from Holistic poses and lift 2D -> 3D.
 
     Args:
-        src: Directory with 2D pose npy files.
-        dst: Output directory for 3D pose npy files.
+        src: Directory with 75-joint Holistic .npy files (shape (T, 225)).
+        dst: Output directory for 3D 50-joint .npy files (shape (T, 150)).
 
     Returns:
-        dict with 'total' and 'skipped' counts.
+        dict with 'total', 'skipped', 'failed' counts.
     """
     src, dst = Path(src), Path(dst)
     clips = sorted(src.glob("*/*.npy"))
-    print(f"Found {len(clips)} 2D pose files in {src}\n")
+    print(f"Found {len(clips)} Holistic pose files in {src}\n")
 
     if not clips:
-        print("No 2D poses found. Run extract_poses.py --mode 50joint first.")
+        print(f"No Holistic poses found in {src}. Run extract_poses.py first.")
         sys.exit(1)
 
     dst.mkdir(parents=True, exist_ok=True)
     structure = get_skeletal_model_structure()
     skipped = 0
+    failed = 0
 
     for i, clip_path in enumerate(clips):
         video_id = clip_path.parent.name
@@ -536,30 +574,38 @@ def lift_all(src, dst):
             skipped += 1
             continue
 
-        poses_2d = np.load(clip_path)
-        T = poses_2d.shape[0]
-        print(f"  [{i+1}/{len(clips)}] {video_id}/{clip_name}: "
-              f"{T} frames, lifting to 3D ...")
+        poses_225 = np.load(clip_path)
+        if poses_225.ndim != 2 or poses_225.shape[0] < 2 or poses_225.shape[1] != 225:
+            print(f"  [{i+1}/{len(clips)}] {video_id}/{clip_name}: "
+                  f"unexpected shape {poses_225.shape}, skipping")
+            failed += 1
+            continue
 
+        poses_2d = holistic_to_50joint(poses_225)
+        print(f"  [{i+1}/{len(clips)}] {video_id}/{clip_name}: "
+              f"{poses_2d.shape[0]} frames, lifting to 3D ...")
         poses_3d = lift_clip(poses_2d, structure)
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         np.save(out_path, poses_3d)
         print(f"    → saved {out_path}")
 
-    print(f"\nDone. 3D poses written to {dst}")
-    return {"total": len(clips), "skipped": skipped}
+    total = len(list(dst.glob("*/*.npy")))
+    print(f"\nDone. {total} 3D poses written to {dst}  "
+          f"({skipped} cached, {failed} failed)")
+    return {"total": total, "skipped": skipped, "failed": failed}
 
 
 def main():
     import argparse
 
-    default_src = ROOT / "data/usl-suspilne/poses/2d"
-    default_dst = ROOT / "data/usl-suspilne/poses/3d"
+    default_src = ROOT / "data/usl-suspilne/poses/mediapipe_holistic"
+    default_dst = ROOT / "data/usl-suspilne/poses/mediapipe_3d"
 
-    parser = argparse.ArgumentParser(description="Lift 2D poses to 3D")
+    parser = argparse.ArgumentParser(
+        description="Select 50 joints from Holistic and lift 2D -> 3D")
     parser.add_argument("--src", type=Path, default=default_src,
-                        help=f"2D poses directory (default: {default_src})")
+                        help=f"Holistic poses directory (default: {default_src})")
     parser.add_argument("--dst", type=Path, default=default_dst,
                         help=f"3D poses output directory (default: {default_dst})")
     args = parser.parse_args()

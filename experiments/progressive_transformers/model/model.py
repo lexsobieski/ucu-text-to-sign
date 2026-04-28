@@ -16,6 +16,7 @@ from constants import PAD_TOKEN, EOS_TOKEN, BOS_TOKEN, TARGET_PAD
 from search import greedy
 from vocabulary import Vocabulary
 from batch import Batch
+from mdn import mdn_output_size, split_mdn_output, mdn_nll, mdn_to_pose
 
 class Model(nn.Module):
     """
@@ -74,6 +75,16 @@ class Model(nn.Module):
 
         # Future Prediction - predict for this many frames in the future
         self.future_prediction = model_cfg.get("future_prediction", 0)
+
+        # MDN — when > 0, the decoder output is (log_pi, mu, log_sigma) of a mixture
+        self.mdn_n_components = model_cfg.get("mdn_n_components", 0)
+        # self.out_trg_size passed in is the *pose* target dim (D) when MDN is on
+        self.mdn_pose_dim = self.out_trg_size if self.mdn_n_components > 0 else None
+        self.mdn_inference_mode = model_cfg.get("mdn_inference_mode", "argmax")
+
+        if self.mdn_n_components > 0 and self.gaussian_noise:
+            raise ValueError("mdn_n_components>0 is incompatible with gaussian_noise; "
+                             "disable gaussian_noise when using MDN.")
 
     # pylint: disable=arguments-differ
     def forward(self,
@@ -187,10 +198,10 @@ class Model(nn.Module):
             src_mask=batch.src_mask, src_lengths=batch.src_lengths,
             trg_mask=batch.trg_mask)
 
-        # compute batch loss using skel_out and the batch target
+        # compute batch loss; MDN takes raw output, regression takes the predicted pose
         batch_loss = loss_function(skel_out, batch.trg)
 
-        # If gaussian noise, find the noise for the next epoch
+        # If gaussian noise, find the noise for the next epoch (MDN disables this)
         if self.gaussian_noise:
             # Calculate the difference between prediction and GT, to find STDs of error
             with torch.no_grad():
@@ -205,6 +216,12 @@ class Model(nn.Module):
 
         # return batch loss = sum over all elements in batch that are not pad
         return batch_loss, noise
+
+    def decode_mdn(self, raw: Tensor) -> Tensor:
+        """Convert raw MDN output into a deterministic pose tensor."""
+        log_pi, mu, log_sigma = split_mdn_output(
+            raw, self.mdn_n_components, self.mdn_pose_dim)
+        return mdn_to_pose(log_pi, mu, log_sigma, mode=self.mdn_inference_mode)
 
     def run_batch(self, batch: Batch, max_output_length: int,) -> (np.array, np.array):
         """
@@ -277,6 +294,7 @@ def build_model(cfg: dict = None,
 
     just_count_in = cfg.get("just_count_in", False)
     future_prediction = cfg.get("future_prediction", 0)
+    mdn_n_components = cfg.get("mdn_n_components", 0)
 
     #  Just count in limits the in target size to 1
     if just_count_in:
@@ -286,6 +304,12 @@ def build_model(cfg: dict = None,
     if future_prediction != 0:
         # Times the trg_size (minus counter) by amount of predicted frames, and then add back counter
         out_trg_size = (out_trg_size - 1 ) * future_prediction + 1
+
+    # MDN replaces the per-dim regression output with a mixture over the same D dims.
+    # The decoder's final linear layer therefore produces K*(2D+1) values instead of D.
+    mdn_pose_dim = out_trg_size
+    decoder_trg_size = (mdn_output_size(mdn_n_components, out_trg_size)
+                        if mdn_n_components > 0 else out_trg_size)
 
     # Define source embedding
     src_embed = Embeddings(
@@ -316,9 +340,10 @@ def build_model(cfg: dict = None,
     decoder = TransformerDecoder(
         **cfg["decoder"], encoder=encoder, vocab_size=len(trg_vocab),
         emb_size=trg_linear.out_features, emb_dropout=dec_emb_dropout,
-        trg_size=out_trg_size, decoder_trg_trg_=decoder_trg_trg)
+        trg_size=decoder_trg_size, decoder_trg_trg_=decoder_trg_trg)
 
-    # Define the model
+    # Define the model.  When MDN is on, out_trg_size stays equal to the pose dim D;
+    # the decoder emits K*(2D+1) raw values which Model.decode_mdn collapses to D.
     model = Model(encoder=encoder,
                   decoder=decoder,
                   src_embed=src_embed,
@@ -327,7 +352,7 @@ def build_model(cfg: dict = None,
                   trg_vocab=trg_vocab,
                   cfg=full_cfg,
                   in_trg_size=in_trg_size,
-                  out_trg_size=out_trg_size)
+                  out_trg_size=mdn_pose_dim)
 
     # Custom initialization of model parameters
     initialize_model(model, cfg, src_padding_idx, trg_padding_idx)
